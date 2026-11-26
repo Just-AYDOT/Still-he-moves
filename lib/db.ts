@@ -1,78 +1,117 @@
 import "server-only";
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { cert, getApps, initializeApp } from "firebase-admin/app";
+import { AggregateField, FieldValue, getFirestore, type Firestore } from "firebase-admin/firestore";
 import { demoPrayers, demoStories } from "./demo";
 import type { Category, Paper } from "./site";
 import type { Prayer, PrayerStatus, Stats, Story, StoryPrivate, StoryStatus } from "./types";
 
-let client: SupabaseClient | null = null;
+// Firestore collections: stories, prayers, subscribers.
+// Everything is read and written here, on the server, with a service account.
+// The Firestore security rules (firestore.rules) deny all access from browsers.
 
 export function isDemo() {
-  return !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (process.env.FIRESTORE_EMULATOR_HOST) return false;
+  return !process.env.FIREBASE_PROJECT_ID || !process.env.FIREBASE_CLIENT_EMAIL || !process.env.FIREBASE_PRIVATE_KEY;
 }
 
-// Server-only client. The service key never reaches the browser; all reads and writes go through
-// server code, and the database itself refuses anonymous access (see supabase/schema.sql).
+let fs: Firestore | null = null;
 function db() {
-  if (!client) {
-    client = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
-      auth: { persistSession: false },
-    });
-  }
-  return client;
+  if (fs) return fs;
+  const app =
+    getApps()[0] ??
+    initializeApp(
+      process.env.FIRESTORE_EMULATOR_HOST
+        ? { projectId: process.env.FIREBASE_PROJECT_ID || "demo-testimony" }
+        : {
+            credential: cert({
+              projectId: process.env.FIREBASE_PROJECT_ID,
+              clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+              // Hosting dashboards often store the key with literal "\n"; turn them back into line breaks
+              privateKey: process.env.FIREBASE_PRIVATE_KEY!.replace(/\\n/g, "\n"),
+            }),
+          }
+    );
+  fs = getFirestore(app);
+  return fs;
 }
 
-const PUBLIC_STORY =
-  "id,slug,title,category,city,paper,author_name,language,struggle,prayer,turning,now,pull_quote,amen_count,status,created_at,published_at";
+type Doc = FirebaseFirestore.QueryDocumentSnapshot | FirebaseFirestore.DocumentSnapshot;
+const iso = (v: unknown): string | null => (v && typeof (v as { toDate?: () => Date }).toDate === "function" ? (v as { toDate: () => Date }).toDate().toISOString() : typeof v === "string" ? v : null);
 
-function fail(error: { message: string } | null) {
-  if (error) throw new Error(error.message);
+function toStory(d: Doc): StoryPrivate {
+  const x = d.data() ?? {};
+  return {
+    id: d.id,
+    slug: x.slug,
+    title: x.title,
+    category: x.category,
+    city: x.city ?? "",
+    paper: x.paper ?? "Ledger",
+    author_name: x.author_name ?? "Anonymous",
+    language: x.language ?? "English",
+    struggle: x.struggle ?? "",
+    prayer: x.prayer ?? "",
+    turning: x.turning ?? "",
+    now: x.now ?? "",
+    pull_quote: x.pull_quote ?? null,
+    amen_count: x.amen_count ?? 0,
+    status: x.status,
+    created_at: iso(x.created_at) ?? new Date(0).toISOString(),
+    published_at: iso(x.published_at),
+    contact: x.contact ?? null,
+    consent: !!x.consent,
+    admin_note: x.admin_note ?? null,
+  };
+}
+
+function toPublic(s: StoryPrivate): Story {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { contact, consent, admin_note, ...pub } = s;
+  return pub;
+}
+
+function toPrayer(d: Doc): Prayer & { contact: string | null } {
+  const x = d.data() ?? {};
+  return { id: d.id, body: x.body, name: x.name ?? "Someone", city: x.city ?? null, pray_count: x.pray_count ?? 0, status: x.status, created_at: iso(x.created_at) ?? new Date(0).toISOString(), contact: x.contact ?? null };
+}
+
+const newest = <T extends { published_at?: string | null; created_at: string }>(a: T, b: T) => (b.published_at ?? b.created_at).localeCompare(a.published_at ?? a.created_at);
+
+// Queries use a single equality filter and sort in memory, so no composite indexes need setting up.
+async function publishedStories(): Promise<Story[]> {
+  const snap = await db().collection("stories").where("status", "==", "published").get();
+  return snap.docs.map((d) => toPublic(toStory(d))).sort(newest);
 }
 
 /* ---------- Stories ---------- */
 
 export async function listStories(opts: { category?: string; q?: string; limit?: number } = {}): Promise<Story[]> {
   const limit = opts.limit ?? 60;
-  if (isDemo()) {
-    let rows = demoStories.filter((s) => s.status === "published");
-    if (opts.category) rows = rows.filter((s) => s.category === opts.category);
-    if (opts.q) {
-      const q = opts.q.toLowerCase();
-      rows = rows.filter((s) => [s.title, s.city, s.struggle, s.turning, s.now].join(" ").toLowerCase().includes(q));
-    }
-    return rows.slice(0, limit);
-  }
-  let query = db().from("stories").select(PUBLIC_STORY).eq("status", "published").order("published_at", { ascending: false }).limit(limit);
-  if (opts.category) query = query.eq("category", opts.category);
+  let rows = isDemo() ? demoStories.filter((s) => s.status === "published") : await publishedStories();
+  if (opts.category) rows = rows.filter((s) => s.category === opts.category);
   if (opts.q) {
-    const q = opts.q.replace(/[%,()]/g, " ").trim();
-    if (q) query = query.or(`title.ilike.%${q}%,city.ilike.%${q}%,turning.ilike.%${q}%`);
+    const q = opts.q.toLowerCase();
+    rows = rows.filter((s) => [s.title, s.city, s.struggle, s.prayer, s.turning, s.now].join(" ").toLowerCase().includes(q));
   }
-  const { data, error } = await query;
-  fail(error);
-  return (data ?? []) as Story[];
+  return rows.slice(0, limit);
 }
 
 export async function getStory(slug: string): Promise<Story | null> {
   if (isDemo()) return demoStories.find((s) => s.slug === slug && s.status === "published") ?? null;
-  const { data, error } = await db().from("stories").select(PUBLIC_STORY).eq("slug", slug).eq("status", "published").maybeSingle();
-  fail(error);
-  return (data as Story) ?? null;
+  const snap = await db().collection("stories").where("slug", "==", slug).limit(1).get();
+  const s = snap.docs[0] ? toStory(snap.docs[0]) : null;
+  return s && s.status === "published" ? toPublic(s) : null;
 }
 
 export async function relatedStories(story: Story, limit = 3): Promise<Story[]> {
-  const same = (await listStories({ category: story.category, limit: limit + 1 })).filter((s) => s.id !== story.id);
-  if (same.length >= limit) return same.slice(0, limit);
-  const more = (await listStories({ limit: limit + 4 })).filter((s) => s.id !== story.id && !same.some((x) => x.id === s.id));
-  return [...same, ...more].slice(0, limit);
+  const all = (await listStories({ limit: 200 })).filter((s) => s.id !== story.id);
+  const same = all.filter((s) => s.category === story.category);
+  return [...same, ...all.filter((s) => s.category !== story.category)].slice(0, limit);
 }
 
 export async function categoryCounts(): Promise<Record<string, number>> {
-  if (isDemo()) {
-    return demoStories.reduce<Record<string, number>>((acc, s) => ((acc[s.category] = (acc[s.category] ?? 0) + 1), acc), {});
-  }
-  const { data, error } = await db().rpc("category_counts");
-  fail(error);
-  return Object.fromEntries(((data ?? []) as { category: string; n: number }[]).map((r) => [r.category, Number(r.n)]));
+  const rows = await listStories({ limit: 100000 });
+  return rows.reduce<Record<string, number>>((acc, s) => ((acc[s.category] = (acc[s.category] ?? 0) + 1), acc), {});
 }
 
 export async function getStats(): Promise<Stats> {
@@ -84,10 +123,18 @@ export async function getStats(): Promise<Stats> {
       cities: new Set(demoStories.map((s) => s.city)).size,
     };
   }
-  const { data, error } = await db().rpc("site_stats");
-  fail(error);
-  const r = (Array.isArray(data) ? data[0] : data) ?? {};
-  return { stories: Number(r.stories ?? 0), prayers: Number(r.prayers ?? 0), answered: Number(r.answered ?? 0), cities: Number(r.cities ?? 0) };
+  const prayers = db().collection("prayers");
+  const [stories, open, answered] = await Promise.all([
+    publishedStories(),
+    prayers.where("status", "==", "published").aggregate({ total: AggregateField.sum("pray_count") }).get(),
+    prayers.where("status", "==", "answered").aggregate({ total: AggregateField.sum("pray_count"), n: AggregateField.count() }).get(),
+  ]);
+  return {
+    stories: stories.length,
+    prayers: Number(open.data().total ?? 0) + Number(answered.data().total ?? 0),
+    answered: answered.data().n,
+    cities: new Set(stories.map((s) => s.city.trim().toLowerCase()).filter(Boolean)).size,
+  };
 }
 
 export type NewStory = {
@@ -120,52 +167,53 @@ function slugify(s: string) {
 export async function createStory(input: NewStory): Promise<{ ok: true; demo: boolean }> {
   if (isDemo()) return { ok: true, demo: true };
   const slug = `${slugify(input.title)}-${Math.random().toString(36).slice(2, 6)}`;
-  const { error } = await db().from("stories").insert({ ...input, slug, status: "pending" });
-  fail(error);
+  await db().collection("stories").add({ ...input, slug, status: "pending", amen_count: 0, pull_quote: null, admin_note: null, created_at: FieldValue.serverTimestamp(), published_at: null });
   return { ok: true, demo: false };
+}
+
+async function bump(collection: string, id: string, field: string, allowed: string[]): Promise<number | null> {
+  const ref = db().collection(collection).doc(id);
+  return db().runTransaction(async (t) => {
+    const snap = await t.get(ref);
+    if (!snap.exists || !allowed.includes(snap.get("status"))) return null;
+    const next = (snap.get(field) ?? 0) + 1;
+    t.update(ref, { [field]: FieldValue.increment(1) });
+    return next;
+  });
 }
 
 export async function addAmen(id: string): Promise<number | null> {
   if (isDemo()) return null;
-  const { data, error } = await db().rpc("add_amen", { story_id: id });
-  fail(error);
-  return Number(data);
+  return bump("stories", id, "amen_count", ["published"]);
 }
 
 /* ---------- Prayer wall ---------- */
 
 export async function listPrayers(limit = 60): Promise<Prayer[]> {
   if (isDemo()) return demoPrayers;
-  const { data, error } = await db()
-    .from("prayers")
-    .select("id,body,name,city,pray_count,status,created_at")
-    .in("status", ["published", "answered"])
-    .order("created_at", { ascending: false })
-    .limit(limit);
-  fail(error);
-  return (data ?? []) as Prayer[];
+  const snap = await db().collection("prayers").where("status", "in", ["published", "answered"]).get();
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  return snap.docs.map(toPrayer).map(({ contact, ...p }) => p).sort(newest).slice(0, limit);
 }
 
 export async function createPrayer(input: { body: string; name: string; city: string | null; contact: string | null }) {
   if (isDemo()) return { ok: true, demo: true };
-  const { error } = await db().from("prayers").insert({ ...input, status: "pending" });
-  fail(error);
+  await db().collection("prayers").add({ ...input, status: "pending", pray_count: 0, created_at: FieldValue.serverTimestamp() });
   return { ok: true, demo: false };
 }
 
 export async function prayFor(id: string): Promise<number | null> {
   if (isDemo()) return null;
-  const { data, error } = await db().rpc("add_prayed", { prayer_id: id });
-  fail(error);
-  return Number(data);
+  return bump("prayers", id, "pray_count", ["published", "answered"]);
 }
 
 /* ---------- Email ---------- */
 
 export async function subscribe(email: string) {
   if (isDemo()) return { ok: true, demo: true };
-  const { error } = await db().from("subscribers").upsert({ email: email.toLowerCase() }, { onConflict: "email", ignoreDuplicates: true });
-  fail(error);
+  const e = email.toLowerCase();
+  // Document id is the email (URL-encoded), so signing up twice doesn't create duplicates
+  await db().collection("subscribers").doc(encodeURIComponent(e)).set({ email: e, created_at: FieldValue.serverTimestamp() }, { merge: true });
   return { ok: true, demo: false };
 }
 
@@ -173,38 +221,32 @@ export async function subscribe(email: string) {
 
 export async function adminStories(status: StoryStatus): Promise<StoryPrivate[]> {
   if (isDemo()) return [];
-  const { data, error } = await db().from("stories").select("*").eq("status", status).order("created_at", { ascending: false }).limit(100);
-  fail(error);
-  return (data ?? []) as StoryPrivate[];
+  const snap = await db().collection("stories").where("status", "==", status).get();
+  return snap.docs.map(toStory).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 200);
 }
 
 export async function adminPrayers(status: PrayerStatus): Promise<(Prayer & { contact: string | null })[]> {
   if (isDemo()) return [];
-  const { data, error } = await db().from("prayers").select("*").eq("status", status).order("created_at", { ascending: false }).limit(100);
-  fail(error);
-  return (data ?? []) as (Prayer & { contact: string | null })[];
+  const snap = await db().collection("prayers").where("status", "==", status).get();
+  return snap.docs.map(toPrayer).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 200);
 }
 
 export async function setStoryStatus(id: string, status: StoryStatus) {
   const patch: Record<string, unknown> = { status };
-  if (status === "published") patch.published_at = new Date().toISOString();
-  const { error } = await db().from("stories").update(patch).eq("id", id);
-  fail(error);
+  if (status === "published") patch.published_at = FieldValue.serverTimestamp();
+  await db().collection("stories").doc(id).update(patch);
 }
 
 export async function updateStoryText(id: string, fields: Partial<Pick<StoryPrivate, "title" | "struggle" | "prayer" | "turning" | "now" | "pull_quote" | "admin_note">>) {
-  const { error } = await db().from("stories").update(fields).eq("id", id);
-  fail(error);
+  await db().collection("stories").doc(id).update(fields);
 }
 
 export async function setPrayerStatus(id: string, status: PrayerStatus) {
-  const { error } = await db().from("prayers").update({ status }).eq("id", id);
-  fail(error);
+  await db().collection("prayers").doc(id).update({ status });
 }
 
 export async function subscriberCount(): Promise<number> {
   if (isDemo()) return 0;
-  const { count, error } = await db().from("subscribers").select("email", { count: "exact", head: true });
-  fail(error);
-  return count ?? 0;
+  const snap = await db().collection("subscribers").count().get();
+  return snap.data().count;
 }

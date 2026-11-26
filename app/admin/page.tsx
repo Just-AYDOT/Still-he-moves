@@ -20,7 +20,7 @@ export default async function AdminPage({ searchParams }: { searchParams: Promis
     return <Shell><LoginForm /></Shell>;
   }
   if (isDemo()) {
-    return <Shell><p className="card">Connect Supabase (see the README) to start reviewing real stories. In preview mode nothing is saved.</p></Shell>;
+    return <Shell><p className="card">Connect Firebase (see the README) to start reviewing real stories. In preview mode nothing is saved.</p></Shell>;
   }
 
   const [pending, published, prayers, livePrayers, subs] = await Promise.all([adminStories("pending"), adminStories("published"), adminPrayers("pending"), adminPrayers("published"), subscriberCount()]);
