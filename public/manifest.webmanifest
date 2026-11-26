@@ -1,0 +1,10 @@
+{
+  "name": "Still He Moves",
+  "short_name": "Still He Moves",
+  "description": "First-hand testimonies of what God did.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f7f9",
+  "theme_color": "#0e1b3d",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
