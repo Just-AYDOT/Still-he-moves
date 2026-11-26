@@ -1,0 +1,10 @@
+rules_version = '2';
+// The website reads and writes Firestore only from its server, using a service account,
+// which these rules don't apply to. Browsers and apps get no direct access at all.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
